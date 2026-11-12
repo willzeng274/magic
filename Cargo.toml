@@ -1,0 +1,16 @@
+[package]
+name = "magic"
+version = "0.1.0"
+edition = "2021"
+description = "Move Magic keyboards, mice and trackpads between Macs"
+
+[dependencies]
+ratatui = "0.29"
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
