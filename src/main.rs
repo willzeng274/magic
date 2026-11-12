@@ -2,8 +2,9 @@
 //!
 //! A Magic device remembers one Mac at a time. Moving it means unpairing it from the Mac that
 //! has it and pairing it to the other. Reading where things are needs no permission
-//! (system_profiler). Moving uses blueutil, which macOS only allows once Bluetooth access is
-//! granted: to the terminal app for this Mac, and to SSH for the other Mac.
+//! (system_profiler). Moving uses blueutil over SSH on every Mac, this one included, because
+//! macOS only lets it through for SSH. Each Mac needs Bluetooth access granted to
+//! /usr/libexec/sshd-keygen-wrapper, and `magic setup` run once.
 
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
@@ -119,6 +120,13 @@ fn run_on(host: &Host, cmd: &str) -> (bool, String) {
     }
 }
 
+/// Run a Bluetooth command on a Mac. Always over SSH, this Mac included: macOS only lets
+/// blueutil through when SSH is the caller (terminal apps get it aborted even when allowed).
+fn run_bt(host: &Host, cmd: &str) -> (bool, String) {
+    let via_ssh = Host { local: false, ..host.clone() };
+    run_on(&via_ssh, cmd)
+}
+
 // ---------------------------------------------------------------- reading devices
 
 fn is_magic(name: &str, minor: &str, vendor: &str) -> Option<String> {
@@ -182,17 +190,15 @@ fn scan(hosts: &[Host]) -> Scan {
 
 /// Can this Mac drive Bluetooth right now? Err carries what to do about it.
 fn preflight(host: &Host) -> Result<(), String> {
-    let (_, out) = run_on(host, &format!("{BLUEUTIL} --power"));
+    let (_, out) = run_bt(host, &format!("{BLUEUTIL} --power"));
     if out.trim() == "1" {
         return Ok(());
     }
     let k = &host.key;
     Err(if out.contains("No such file") || out.contains("not found") {
         format!("{k}: blueutil is missing. Run: brew install blueutil")
-    } else if host.local {
-        format!("{k}: this terminal is not allowed to use Bluetooth. System Settings > Privacy & Security > Bluetooth, switch on your terminal app, then try again.")
     } else if out.contains("Permission denied") || out.contains("Could not resolve") || out.contains("timed out") || out.contains("refused") {
-        format!("{k}: cannot log in over SSH ({}).", out.lines().last().unwrap_or(""))
+        format!("{k}: cannot log in over SSH. Run: magic setup")
     } else {
         format!("{k}: SSH is not allowed to use Bluetooth there. On {k}: System Settings > Privacy & Security > Bluetooth > +, press Cmd+Shift+G, add /usr/libexec/sshd-keygen-wrapper.")
     })
@@ -218,7 +224,7 @@ fn move_device(hosts: &[Host], dev: &Device, to: &str, log: &dyn Fn(String)) -> 
     }
     for h in &holders {
         log(format!("{}: releasing from {}", dev.name, h.key));
-        run_on(h, &format!("{BLUEUTIL} --unpair {}", dev.addr));
+        run_bt(h, &format!("{BLUEUTIL} --unpair {}", dev.addr));
     }
     thread::sleep(Duration::from_secs(2));
     log(format!("{}: pairing on {to}", dev.name));
@@ -226,7 +232,7 @@ fn move_device(hosts: &[Host], dev: &Device, to: &str, log: &dyn Fn(String)) -> 
     let script = format!(
         "for i in 1 2 3 4 5 6; do {BLUEUTIL} --pair {a} >/dev/null 2>&1 && break; {BLUEUTIL} --inquiry 2 >/dev/null 2>&1; done; {BLUEUTIL} --connect {a} >/dev/null 2>&1; sleep 1; {BLUEUTIL} --is-connected {a}"
     );
-    let (_, out) = run_on(target, &script);
+    let (_, out) = run_bt(target, &script);
     if out.trim().ends_with('1') {
         log(format!("{}: connected to {to}", dev.name));
         true
@@ -247,9 +253,48 @@ fn usage(hosts: &[Host], devices: &[Device]) {
     println!("  {:<14} Move every Magic device to this Mac", "here");
     println!("  {:<14} Show which Mac each device is on", "status");
     println!("  {:<14} Test SSH and Bluetooth permission on every Mac", "check");
+    println!("  {:<14} One-time: set up SSH between the Macs (run it on each Mac)", "setup");
     println!("  {:<14} Show this help\n", "help");
     let slugs: Vec<String> = devices.iter().map(|d| d.slug()).collect();
     println!("Devices: {}   Macs: {}", slugs.join(", "), keys.join(", "));
+}
+
+/// One-time: let this Mac log in to itself and to the other Macs with its SSH key.
+fn setup(hosts: &[Host]) -> i32 {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let key = format!("{home}/.ssh/id_ed25519");
+    if !std::path::Path::new(&format!("{key}.pub")).exists() {
+        println!("creating an SSH key for this Mac");
+        let _ = Command::new("ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f", &key]).status();
+    }
+    let Ok(pubkey) = std::fs::read_to_string(format!("{key}.pub")) else {
+        eprintln!("magic: no SSH public key at {key}.pub");
+        return 1;
+    };
+    let pubkey = pubkey.trim();
+    for h in hosts {
+        if h.local {
+            let path = format!("{home}/.ssh/authorized_keys");
+            let have = std::fs::read_to_string(&path).unwrap_or_default();
+            if have.contains(pubkey) {
+                println!("{}: this Mac already accepts its own key", h.key);
+            } else {
+                let sep = if have.is_empty() || have.ends_with('\n') { "" } else { "\n" };
+                match std::fs::write(&path, format!("{have}{sep}{pubkey}\n")) {
+                    Ok(()) => println!("{}: added this Mac's key to {path}", h.key),
+                    Err(e) => println!("{}: could not write {path}: {e}", h.key),
+                }
+                let _ = Command::new("chmod").args(["600", &path]).status();
+            }
+        } else if run_on(h, "true").0 {
+            println!("{}: already reachable", h.key);
+        } else {
+            println!("{}: copying this Mac's key there (it will ask for that Mac's password once)", h.key);
+            let _ = Command::new("ssh-copy-id").args(["-o", "StrictHostKeyChecking=accept-new", "-i", &format!("{key}.pub"), &h.target]).status();
+        }
+    }
+    println!();
+    cli(&["check".to_string()], hosts)
 }
 
 fn cli(args: &[String], hosts: &[Host]) -> i32 {
@@ -262,6 +307,7 @@ fn cli(args: &[String], hosts: &[Host]) -> i32 {
             }
             None => 1,
         },
+        "setup" => setup(hosts),
         "check" => {
             for h in hosts {
                 match preflight(h) {
