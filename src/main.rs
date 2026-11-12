@@ -37,6 +37,8 @@ struct Host {
 enum Link {
     Connected,
     Paired,
+    /// Plugged into that Mac with a cable. It types over USB and cannot be moved until unplugged.
+    Usb,
 }
 
 #[derive(Clone)]
@@ -149,17 +151,21 @@ fn is_magic(name: &str, minor: &str, vendor: &str) -> Option<String> {
     }
 }
 
+const HID_MARK: &str = "<<<HID>>>";
+const SCAN_CMD: &str = "system_profiler SPBluetoothDataType -json; echo '<<<HID>>>'; ioreg -r -c AppleDeviceManagementHIDEventService -l | grep -E '\\+-o|\"DeviceAddress\"|\"Product\"|\"Transport\"'";
+
 fn scan(hosts: &[Host]) -> Scan {
     let handles: Vec<_> = hosts
         .iter()
         .cloned()
-        .map(|h| thread::spawn(move || (h.key.clone(), run_on(&h, "system_profiler SPBluetoothDataType -json"))))
+        .map(|h| thread::spawn(move || (h.key.clone(), run_on(&h, SCAN_CMD))))
         .collect();
     let mut devices: BTreeMap<String, Device> = BTreeMap::new();
     let mut reachable = BTreeMap::new();
     for handle in handles {
         let Ok((key, (ok, text))) = handle.join() else { continue };
-        let json: Option<Value> = if ok { serde_json::from_str(&text).ok() } else { None };
+        let (bt, hid) = text.split_once(HID_MARK).unwrap_or((text.as_str(), ""));
+        let json: Option<Value> = if ok { serde_json::from_str(bt).ok() } else { None };
         reachable.insert(key.clone(), json.is_some());
         let Some(json) = json else { continue };
         let root = &json["SPBluetoothDataType"][0];
@@ -178,6 +184,23 @@ fn scan(hosts: &[Host]) -> Scan {
                     }
                     d.links.insert(key.clone(), link);
                 }
+            }
+        }
+        // Devices plugged in by cable: the HID registry lists them with Transport = USB.
+        let (mut addr, mut product) = (String::new(), String::new());
+        for line in hid.lines() {
+            let val = line.split_once('=').map(|(_, v)| v.trim().trim_matches('"').to_string()).unwrap_or_default();
+            if line.contains("+-o") {
+                addr.clear();
+                product.clear();
+            } else if line.contains("\"DeviceAddress\"") {
+                addr = val.replace('-', ":").to_uppercase();
+            } else if line.contains("\"Product\"") {
+                product = val;
+            } else if line.contains("\"Transport\"") && val == "USB" && !addr.is_empty() {
+                let kind = if product.to_lowercase().contains("trackpad") { "trackpad" } else if product.to_lowercase().contains("mouse") { "mouse" } else { "keyboard" };
+                let d = devices.entry(addr.clone()).or_insert_with(|| Device { addr: addr.clone(), name: product.clone(), kind: kind.to_string(), battery: String::new(), links: BTreeMap::new() });
+                d.links.insert(key.clone(), Link::Usb);
             }
         }
     }
@@ -212,6 +235,10 @@ fn move_device(hosts: &[Host], dev: &Device, to: &str, log: &dyn Fn(String)) -> 
     if dev.links.get(to) == Some(&Link::Connected) {
         log(format!("{}: already on {to}", dev.name));
         return true;
+    }
+    if let Some((mac, _)) = dev.links.iter().find(|(_, l)| **l == Link::Usb) {
+        log(format!("{}: plugged into {mac} with a cable. Unplug it, wait for it to show connected, then move it.", dev.name));
+        return false;
     }
     let holders: Vec<&Host> = hosts.iter().filter(|h| h.key != to && dev.links.contains_key(&h.key)).collect();
     // Check every Mac involved before touching anything, so a device is never left stranded.
@@ -250,6 +277,7 @@ fn usage(hosts: &[Host], devices: &[Device]) {
     println!("Usage: magic            open the interactive view");
     println!("       magic <command>\n");
     println!("  {:<14} Move every Magic device to that Mac", keys.join(" | "));
+    println!("  {:<14} Move one device, for example: magic {} {}", "<mac> <device>", keys.last().copied().unwrap_or("m5"), devices.first().map(|d| d.slug()).unwrap_or_else(|| "black-mouse".into()));
     println!("  {:<14} Move every Magic device to this Mac", "here");
     println!("  {:<14} Show which Mac each device is on", "status");
     println!("  {:<14} Test SSH and Bluetooth permission on every Mac", "check");
@@ -332,6 +360,7 @@ fn cli(args: &[String], hosts: &[Host]) -> i32 {
                     let state = match d.links.get(&h.key) {
                         Some(Link::Connected) => "connected",
                         Some(Link::Paired) => "paired, not connected",
+                        Some(Link::Usb) => "usb cable",
                         None => "not paired",
                     };
                     println!("{}  {:<28} {}", h.key, d.slug(), state);
@@ -347,8 +376,18 @@ fn cli(args: &[String], hosts: &[Host]) -> i32 {
                 return 2;
             };
             let s = scan(hosts);
-            // Only devices that are live somewhere: paired-but-asleep ones cannot be moved.
-            let live: Vec<&Device> = s.devices.iter().filter(|d| d.links.values().any(|l| *l == Link::Connected)).collect();
+            let live: Vec<&Device> = if let Some(want) = args.get(1) {
+                // one named device
+                let found: Vec<&Device> = s.devices.iter().filter(|d| d.slug() == *want).collect();
+                if found.is_empty() {
+                    eprintln!("magic: no device called '{want}'. Run: magic status");
+                    return 2;
+                }
+                found
+            } else {
+                // every device that is live somewhere: paired-but-asleep ones cannot be moved
+                s.devices.iter().filter(|d| d.links.values().any(|l| *l != Link::Paired)).collect()
+            };
             if live.is_empty() {
                 println!("no connected Magic devices found");
                 return 1;
@@ -458,6 +497,7 @@ fn draw(f: &mut Frame, app: &mut App) {
                 cells.push(match d.links.get(&h.key) {
                     Some(Link::Connected) => Cell::from("connected").style(Style::default().fg(Color::Green)),
                     Some(Link::Paired) => Cell::from("paired, off").style(dim),
+                    Some(Link::Usb) => Cell::from("usb cable").style(Style::default().fg(Color::Yellow)),
                     None => Cell::from("-").style(dim),
                 });
             }
