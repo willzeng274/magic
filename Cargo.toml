@@ -1,12 +1,16 @@
 [package]
 name = "magic"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 description = "Move Magic keyboards, mice and trackpads between Macs"
 
 [dependencies]
-ratatui = "0.29"
+ratatui = "0.30"
 serde_json = "1"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
 
 [profile.release]
 opt-level = "z"

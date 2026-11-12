@@ -4,12 +4,12 @@ use crate::{
     host::Host,
 };
 use ratatui::{
+    Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Cell, Paragraph, Row, Table, TableState, Wrap},
-    Frame,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -93,11 +93,11 @@ impl App {
         let hosts = self.hosts.clone();
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let log = |line: String| {
-                let _ = sender.send(Message::Log(line));
+            let log = |line: &str| {
+                let _ = sender.send(Message::Log(line.to_string()));
             };
             for device in &chosen {
-                bluetooth::move_device(&hosts, device, &to, &log);
+                bluetooth::move_device(&hosts, device, &to, log);
             }
             let _ = sender.send(Message::MoveFinished);
         });
@@ -140,8 +140,8 @@ impl App {
             return true;
         }
         match key.code {
-            KeyCode::Down | KeyCode::Char('j') => self.select_offset(1),
-            KeyCode::Up | KeyCode::Char('k') => self.select_offset(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.select_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('a') => self.toggle_mark_all(),
             KeyCode::Char('r') => self.start_scan(),
@@ -161,14 +161,20 @@ impl App {
         true
     }
 
-    fn select_offset(&mut self, offset: isize) {
-        let count = self.devices.len() as isize;
-        if count == 0 {
-            return;
+    fn select_next(&mut self) {
+        let count = self.devices.len();
+        if count > 0 {
+            let current = self.table.selected().unwrap_or(0);
+            self.table.select(Some((current + 1) % count));
         }
-        let current = self.table.selected().unwrap_or(0) as isize;
-        self.table
-            .select(Some((current + offset).rem_euclid(count) as usize));
+    }
+
+    fn select_previous(&mut self) {
+        let count = self.devices.len();
+        if count > 0 {
+            let current = self.table.selected().unwrap_or(0);
+            self.table.select(Some((current + count - 1) % count));
+        }
     }
 
     fn toggle_mark(&mut self) {
@@ -222,10 +228,11 @@ fn event_loop(
         if !event::poll(INPUT_POLL)? {
             continue;
         }
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press && !app.handle_key(key) {
-                return Ok(());
-            }
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+            && !app.handle_key(key)
+        {
+            return Ok(());
         }
     }
 }

@@ -8,7 +8,7 @@ use crate::{
     device::{Device, Link},
     host::Host,
 };
-use std::{thread, time::Duration};
+use std::{fmt, thread, time::Duration};
 
 const BLUEUTIL: &str = "/opt/homebrew/bin/blueutil";
 const PAIR_ATTEMPTS: u32 = 6;
@@ -19,42 +19,56 @@ const SSH_FAILURES: &[&str] = &[
     "refused",
 ];
 
-/// Checks that a Mac can control Bluetooth. The error says what to do about it.
-pub fn check(host: &Host) -> Result<(), String> {
+/// Why a Mac cannot control Bluetooth right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReady {
+    BlueutilMissing,
+    SshLogin,
+    BluetoothPermission,
+}
+
+impl fmt::Display for NotReady {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BlueutilMissing => "blueutil is missing. Run: brew install blueutil",
+            Self::SshLogin => "cannot log in over SSH. Run: magic setup",
+            Self::BluetoothPermission => {
+                "SSH is not allowed to use Bluetooth there. On that Mac: System Settings > \
+                 Privacy & Security > Bluetooth > +, press Cmd+Shift+G, \
+                 add /usr/libexec/sshd-keygen-wrapper."
+            }
+        })
+    }
+}
+
+/// Checks that a Mac can control Bluetooth.
+pub fn check(host: &Host) -> Result<(), NotReady> {
     let output = host.run_over_ssh(&format!("{BLUEUTIL} --power")).text;
     if output == "1" {
-        return Ok(());
+        Ok(())
+    } else if output.contains("No such file") || output.contains("not found") {
+        Err(NotReady::BlueutilMissing)
+    } else if SSH_FAILURES.iter().any(|failure| output.contains(failure)) {
+        Err(NotReady::SshLogin)
+    } else {
+        Err(NotReady::BluetoothPermission)
     }
-    let mac = &host.key;
-    Err(
-        if output.contains("No such file") || output.contains("not found") {
-            "blueutil is missing. Run: brew install blueutil".to_string()
-        } else if SSH_FAILURES.iter().any(|failure| output.contains(failure)) {
-            "cannot log in over SSH. Run: magic setup".to_string()
-        } else {
-            format!(
-                "SSH is not allowed to use Bluetooth there. On {mac}: System Settings > \
-             Privacy & Security > Bluetooth > +, press Cmd+Shift+G, \
-             add /usr/libexec/sshd-keygen-wrapper."
-            )
-        },
-    )
 }
 
 /// Moves one device to the Mac named `to`, reporting progress through `log`.
 /// Returns whether the device ended up connected there.
-pub fn move_device(hosts: &[Host], device: &Device, to: &str, log: &dyn Fn(String)) -> bool {
+pub fn move_device(hosts: &[Host], device: &Device, to: &str, log: impl Fn(&str)) -> bool {
     let name = &device.name;
     let Some(target) = hosts.iter().find(|host| host.key == to) else {
-        log(format!("unknown Mac '{to}'"));
+        log(&format!("unknown Mac '{to}'"));
         return false;
     };
     if device.links.get(to) == Some(&Link::Connected) {
-        log(format!("{name}: already on {to}"));
+        log(&format!("{name}: already on {to}"));
         return true;
     }
     if let Some(mac) = device.cabled_to() {
-        log(format!(
+        log(&format!(
             "{name}: plugged into {mac} with a cable. \
              Unplug it, wait for it to show connected, then move it."
         ));
@@ -69,29 +83,29 @@ pub fn move_device(hosts: &[Host], device: &Device, to: &str, log: &dyn Fn(Strin
     // Verify every Mac first, so a device is never released and then left unclaimed.
     for host in holders.iter().copied().chain([target]) {
         if let Err(problem) = check(host) {
-            log(format!("{}: {problem}", host.key));
-            log(format!("{name}: nothing changed."));
+            log(&format!("{}: {problem}", host.key));
+            log(&format!("{name}: nothing changed."));
             return false;
         }
     }
 
     let address = &device.address;
     for host in &holders {
-        log(format!("{name}: releasing from {}", host.key));
+        log(&format!("{name}: releasing from {}", host.key));
         host.run_over_ssh(&format!("{BLUEUTIL} --unpair {address}"));
     }
 
     // A released device needs a moment before it becomes discoverable again.
     thread::sleep(Duration::from_secs(2));
-    log(format!("{name}: pairing on {to}"));
+    log(&format!("{name}: pairing on {to}"));
     let connected = target
         .run_over_ssh(&pair_script(address))
         .text
         .ends_with('1');
     if connected {
-        log(format!("{name}: connected to {to}"));
+        log(&format!("{name}: connected to {to}"));
     } else {
-        log(format!(
+        log(&format!(
             "{name}: did not connect to {to}. Click or press a key on it and try again, \
              or plug it into {to} with its cable."
         ));

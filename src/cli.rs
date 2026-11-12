@@ -3,35 +3,34 @@ use crate::{
     device::{self, Device, Link},
     host::{self, Host},
 };
-use std::{fs, process::Command};
+use std::{fs, process::Command, process::ExitCode};
 
-const EXIT_OK: i32 = 0;
-const EXIT_FAILED: i32 = 1;
-const EXIT_USAGE: i32 = 2;
+const USAGE_ERROR: u8 = 2;
 
-/// Runs a one-shot command and returns the process exit code.
-pub fn run(args: &[String], hosts: &[Host]) -> i32 {
-    match args[0].as_str() {
+/// Runs a one-shot command. `command` is the first argument, `device` the optional second.
+pub fn run(hosts: &[Host], command: &str, device: Option<&str>) -> ExitCode {
+    match command {
         "help" | "-h" | "--help" => {
             print_usage(hosts, &device::scan(hosts).devices);
-            EXIT_OK
+            ExitCode::SUCCESS
         }
         "self" => print_local_host(hosts),
         "status" => print_status(hosts),
         "check" => print_check(hosts),
         "setup" => setup(hosts),
-        "here" => match hosts.iter().find(|host| host.local) {
-            Some(host) => move_devices(hosts, &host.key, args.get(1)),
-            None => {
+        "here" => {
+            if let Some(here) = hosts.iter().find(|host| host.local) {
+                move_devices(hosts, &here.key, device)
+            } else {
                 eprintln!("magic: this Mac is not in the list of Macs");
-                EXIT_USAGE
+                ExitCode::from(USAGE_ERROR)
             }
-        },
-        name if hosts.iter().any(|host| host.key == name) => move_devices(hosts, name, args.get(1)),
+        }
+        mac if hosts.iter().any(|host| host.key == mac) => move_devices(hosts, mac, device),
         unknown => {
             eprintln!("magic: unknown command '{unknown}'\n");
             print_usage(hosts, &[]);
-            EXIT_USAGE
+            ExitCode::from(USAGE_ERROR)
         }
     }
 }
@@ -56,17 +55,15 @@ fn print_usage(hosts: &[Host], devices: &[Device]) {
     println!("Devices: {}   Macs: {}", slugs.join(", "), macs.join(", "));
 }
 
-fn print_local_host(hosts: &[Host]) -> i32 {
-    match hosts.iter().find(|host| host.local) {
-        Some(host) => {
-            println!("{}", host.key);
-            EXIT_OK
-        }
-        None => EXIT_FAILED,
-    }
+fn print_local_host(hosts: &[Host]) -> ExitCode {
+    let Some(here) = hosts.iter().find(|host| host.local) else {
+        return ExitCode::FAILURE;
+    };
+    println!("{}", here.key);
+    ExitCode::SUCCESS
 }
 
-fn print_status(hosts: &[Host]) -> i32 {
+fn print_status(hosts: &[Host]) -> ExitCode {
     let scan = device::scan(hosts);
     for host in hosts {
         if scan.reachable.get(&host.key) != Some(&true) {
@@ -83,27 +80,27 @@ fn print_status(hosts: &[Host]) -> i32 {
             println!("{}  {:<28} {state}", host.key, device.slug());
         }
     }
-    EXIT_OK
+    ExitCode::SUCCESS
 }
 
-fn print_check(hosts: &[Host]) -> i32 {
+fn print_check(hosts: &[Host]) -> ExitCode {
     for host in hosts {
         match bluetooth::check(host) {
             Ok(()) => println!("{}  ready", host.key),
             Err(problem) => println!("{}  NOT READY\n    {problem}", host.key),
         }
     }
-    EXIT_OK
+    ExitCode::SUCCESS
 }
 
 /// Moves the named device, or every live device when no name is given.
-fn move_devices(hosts: &[Host], to: &str, only: Option<&String>) -> i32 {
+fn move_devices(hosts: &[Host], to: &str, only: Option<&str>) -> ExitCode {
     let scan = device::scan(hosts);
     let chosen: Vec<&Device> = match only {
         Some(slug) => scan
             .devices
             .iter()
-            .filter(|device| device.slug() == *slug)
+            .filter(|device| device.slug() == slug)
             .collect(),
         None => scan
             .devices
@@ -112,32 +109,27 @@ fn move_devices(hosts: &[Host], to: &str, only: Option<&String>) -> i32 {
             .collect(),
     };
     if chosen.is_empty() {
-        return match only {
-            Some(slug) => {
-                eprintln!("magic: no device called '{slug}'. Run: magic status");
-                EXIT_USAGE
-            }
-            None => {
-                println!("no connected Magic devices found");
-                EXIT_FAILED
-            }
-        };
+        if let Some(slug) = only {
+            eprintln!("magic: no device called '{slug}'. Run: magic status");
+            return ExitCode::from(USAGE_ERROR);
+        }
+        println!("no connected Magic devices found");
+        return ExitCode::FAILURE;
     }
 
-    let print = |line: String| println!("{line}");
     let mut all_moved = true;
     for device in chosen {
-        all_moved &= bluetooth::move_device(hosts, device, to, &print);
+        all_moved &= bluetooth::move_device(hosts, device, to, |line| println!("{line}"));
     }
     if all_moved {
-        EXIT_OK
+        ExitCode::SUCCESS
     } else {
-        EXIT_FAILED
+        ExitCode::FAILURE
     }
 }
 
 /// Lets this Mac log in over SSH to itself and to the other Macs with its own key.
-fn setup(hosts: &[Host]) -> i32 {
+fn setup(hosts: &[Host]) -> ExitCode {
     let ssh_dir = host::home_dir().join(".ssh");
     let private_key = ssh_dir.join("id_ed25519");
     let public_key_path = ssh_dir.join("id_ed25519.pub");
@@ -150,7 +142,7 @@ fn setup(hosts: &[Host]) -> i32 {
     }
     let Ok(public_key) = fs::read_to_string(&public_key_path) else {
         eprintln!("magic: no SSH public key at {}", public_key_path.display());
-        return EXIT_FAILED;
+        return ExitCode::FAILURE;
     };
     let public_key = public_key.trim();
 

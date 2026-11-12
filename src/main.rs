@@ -8,16 +8,20 @@ mod device;
 mod host;
 mod tui;
 
-use std::{env, process};
+use std::{env, process::ExitCode};
 
-fn main() {
+fn main() -> ExitCode {
     let hosts = host::load();
     let args: Vec<String> = env::args().skip(1).collect();
-    if !args.is_empty() {
-        process::exit(cli::run(&args, &hosts));
+
+    if let Some(command) = args.first() {
+        return cli::run(&hosts, command, args.get(1).map(String::as_str));
     }
-    if let Err(err) = tui::run(hosts) {
-        eprintln!("magic: {err}");
-        process::exit(1);
+    match tui::run(hosts) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("magic: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
