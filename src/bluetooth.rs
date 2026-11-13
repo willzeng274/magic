@@ -22,6 +22,8 @@ const SSH_FAILURES: &[&str] = &[
     "Could not resolve",
     "timed out",
     "refused",
+    "No route",
+    "unreachable",
 ];
 
 /// Why a Mac cannot control Bluetooth right now.
@@ -94,6 +96,23 @@ pub fn move_device(hosts: &[Host], device: &Device, to: &str, log: impl Fn(&str)
         }
     }
 
+    // With no Mac showing it connected, a Mac that does not answer may be the one
+    // holding it, and pairing elsewhere cannot work until that Mac lets go.
+    if !device.is_live() {
+        let silent = hosts
+            .iter()
+            .filter(|host| host.key != to && !device.links.contains_key(&host.key))
+            .find(|host| check(host).is_err());
+        if let Some(host) = silent {
+            log(&format!(
+                "{name}: {} is not answering and may be holding it. \
+                 Wake that Mac and try again. Nothing changed.",
+                host.key
+            ));
+            return false;
+        }
+    }
+
     let address = &device.address;
     let origin = holders
         .iter()
@@ -146,7 +165,14 @@ pub fn move_device(hosts: &[Host], device: &Device, to: &str, log: impl Fn(&str)
 /// answers keeps it. Returns the name of that Mac.
 pub fn rescue(hosts: &[Host], device: &Device, log: impl Fn(&str)) -> Option<String> {
     let name = &device.name;
-    let ready: Vec<&Host> = hosts.iter().filter(|host| check(host).is_ok()).collect();
+    let (ready, silent): (Vec<&Host>, Vec<&Host>) =
+        hosts.iter().partition(|host| check(host).is_ok());
+    for host in silent {
+        log(&format!(
+            "{name}: {} is not answering. If the device is on that Mac, wake it instead.",
+            host.key
+        ));
+    }
     if ready.is_empty() {
         log(&format!("{name}: no Mac is ready. Run: magic check"));
         return None;
