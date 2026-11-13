@@ -12,7 +12,7 @@ use crate::{
     device::{Device, Link},
     host::Host,
 };
-use std::{fmt, time::Instant};
+use std::{fmt, sync::mpsc, thread, time::Instant};
 
 const BLUEUTIL: &str = "/opt/homebrew/bin/blueutil";
 /// How long a Mac keeps trying to pair a device before giving up.
@@ -136,10 +136,43 @@ pub fn move_device(hosts: &[Host], device: &Device, to: &str, log: impl Fn(&str)
         }
     }
     log(&format!(
-        "{name}: not connected to any Mac now. Plug it into {to} with its cable \
-         for a few seconds, or switch it off and on and try again."
+        "{name}: not connected to any Mac now. Switch it off and on, then run \
+         'magic rescue', or plug it into {to} with its cable for a few seconds."
     ));
     false
+}
+
+/// Has every Mac try to pair a device that no Mac holds. Whichever one the device
+/// answers keeps it. Returns the name of that Mac.
+pub fn rescue(hosts: &[Host], device: &Device, log: impl Fn(&str)) -> Option<String> {
+    let name = &device.name;
+    let ready: Vec<&Host> = hosts.iter().filter(|host| check(host).is_ok()).collect();
+    if ready.is_empty() {
+        log(&format!("{name}: no Mac is ready. Run: magic check"));
+        return None;
+    }
+    let macs: Vec<&str> = ready.iter().map(|host| host.key.as_str()).collect();
+    log(&format!(
+        "{name}: switch it off and on now. Trying from {}",
+        macs.join(" and ")
+    ));
+    // Report as soon as one Mac has it; the others give up on their own.
+    let (sender, results) = mpsc::channel();
+    for host in ready {
+        let (host, address, sender) = (host.clone(), device.address.clone(), sender.clone());
+        thread::spawn(move || {
+            let _ = sender.send(pair(&host, &address).then_some(host.key));
+        });
+    }
+    drop(sender);
+    let winner = results.iter().flatten().next();
+    match &winner {
+        Some(mac) => log(&format!("{name}: connected to {mac}")),
+        None => log(&format!(
+            "{name}: no Mac could reach it. Plug it into a Mac with its cable for a few seconds."
+        )),
+    }
+    winner
 }
 
 fn is_connected(host: &Host, address: &str) -> bool {
@@ -156,10 +189,13 @@ fn pair(host: &Host, address: &str) -> bool {
 /// Shell script that keeps pairing until the device is really connected, then prints 1.
 /// A pairing the device did not accept is removed before the next try.
 fn pair_script(address: &str) -> String {
-    // `blueutil --pair` can hang for minutes, so every call gets a time limit.
+    // `blueutil --pair` can hang for minutes, so every call gets a time limit. Right after
+    // pairing it can also report connected for a moment when the device is not, so the
+    // connection has to hold for two seconds to count.
     format!(
         "b() {{ perl -e 'alarm shift; exec @ARGV' \"$@\" >/dev/null 2>&1; }}; \
-         on() {{ [ \"$({BLUEUTIL} --is-connected {address} 2>/dev/null)\" = 1 ]; }}; \
+         c() {{ [ \"$({BLUEUTIL} --is-connected {address} 2>/dev/null)\" = 1 ]; }}; \
+         on() {{ c && sleep 2 && c; }}; \
          end=$(( $(date +%s) + {PAIR_SECONDS} )); \
          while [ $(date +%s) -lt $end ]; do \
            on && echo 1 && exit 0; \

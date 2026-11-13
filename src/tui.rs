@@ -103,6 +103,22 @@ impl App {
         });
     }
 
+    /// Has every Mac try to pair the highlighted device, when no Mac holds it.
+    fn start_rescue(&mut self) {
+        let Some(device) = self.selected().filter(|d| !d.is_live()).cloned() else {
+            return;
+        };
+        self.moving = true;
+        let hosts = self.hosts.clone();
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            bluetooth::rescue(&hosts, &device, |line| {
+                let _ = sender.send(Message::Log(line.to_string()));
+            });
+            let _ = sender.send(Message::MoveFinished);
+        });
+    }
+
     fn selected(&self) -> Option<&Device> {
         self.table
             .selected()
@@ -145,6 +161,7 @@ impl App {
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('a') => self.toggle_mark_all(),
             KeyCode::Char('r') => self.start_scan(),
+            KeyCode::Char('x') => self.start_rescue(),
             KeyCode::Enter => {
                 if let Some(here) = self.hosts.iter().find(|host| host.local) {
                     self.start_move(here.key.clone());
@@ -272,7 +289,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 
     let hint = format!(
         " ↑↓ pick   space mark   a mark all   1-{} send to that Mac   \
-         enter bring to this Mac   r refresh   q quit",
+         enter bring to this Mac   x rescue   r refresh   q quit",
         app.hosts.len()
     );
     frame.render_widget(Paragraph::new(hint).style(bold()), keys);
@@ -343,11 +360,15 @@ fn device_table(app: &App) -> Table<'static> {
             Cell::from(device.kind.to_string()),
             Cell::from(device.battery.clone().unwrap_or_else(|| "-".into())),
         ];
-        cells.extend(
-            app.hosts
-                .iter()
-                .map(|host| link_cell(device.links.get(&host.key))),
-        );
+        if device.links.is_empty() {
+            cells.push(Cell::from("lost: press x").style(Style::default().fg(Color::Red)));
+        } else {
+            cells.extend(
+                app.hosts
+                    .iter()
+                    .map(|host| link_cell(device.links.get(&host.key))),
+            );
+        }
         Row::new(cells)
     });
 

@@ -6,6 +6,7 @@ mod bluetooth;
 mod cli;
 mod device;
 mod host;
+mod known;
 mod tui;
 
 use std::{env, process::ExitCode};

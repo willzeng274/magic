@@ -2,6 +2,7 @@ use crate::{
     bluetooth,
     device::{self, Device, Link},
     host::{self, Host},
+    known,
 };
 use std::{fs, process::Command, process::ExitCode};
 
@@ -18,6 +19,8 @@ pub fn run(hosts: &[Host], command: &str, device: Option<&str>) -> ExitCode {
         "status" => print_status(hosts),
         "check" => print_check(hosts),
         "setup" => setup(hosts),
+        "rescue" => rescue(hosts, device),
+        "forget" => forget(hosts, device),
         "here" => {
             if let Some(here) = hosts.iter().find(|host| host.local) {
                 move_devices(hosts, &here.key, device)
@@ -49,6 +52,8 @@ fn print_usage(hosts: &[Host], devices: &[Device]) {
     println!("  <mac> <device> Move one device, for example: magic {example_mac} {example_device}");
     println!("  here           Move every Magic device to this Mac");
     println!("  status         Show which Mac each device is on");
+    println!("  rescue         Get back a device that ended up on no Mac");
+    println!("  forget <dev>   Drop a device you no longer own from the list");
     println!("  check          Test SSH and Bluetooth permission on every Mac");
     println!("  setup          One-time: set up SSH between the Macs (run it on each Mac)");
     println!("  help           Show this help\n");
@@ -125,6 +130,55 @@ fn move_devices(hosts: &[Host], to: &str, only: Option<&str>) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// Recovers the named device, or every device that no Mac holds.
+fn rescue(hosts: &[Host], only: Option<&str>) -> ExitCode {
+    let scan = device::scan(hosts);
+    let lost: Vec<&Device> = scan
+        .devices
+        .iter()
+        .filter(|device| !device.is_live() && only.is_none_or(|slug| device.slug() == slug))
+        .collect();
+    if lost.is_empty() {
+        println!("nothing to rescue: every device is on a Mac");
+        return ExitCode::SUCCESS;
+    }
+    let mut all_back = true;
+    for device in lost {
+        all_back &= bluetooth::rescue(hosts, device, |line| println!("{line}")).is_some();
+    }
+    if all_back {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn forget(hosts: &[Host], slug: Option<&str>) -> ExitCode {
+    let Some(slug) = slug else {
+        eprintln!("magic: say which device, for example: magic forget black-mouse");
+        return ExitCode::from(USAGE_ERROR);
+    };
+    let scan = device::scan(hosts);
+    match scan.devices.iter().find(|device| device.slug() == slug) {
+        Some(device) if device.links.is_empty() => {
+            known::forget(&device.address);
+            println!("forgot {}", device.name);
+            ExitCode::SUCCESS
+        }
+        Some(device) => {
+            eprintln!(
+                "magic: {} is still paired with a Mac. Remove it in Bluetooth settings first.",
+                device.name
+            );
+            ExitCode::FAILURE
+        }
+        None => {
+            eprintln!("magic: no device called '{slug}'. Run: magic status");
+            ExitCode::from(USAGE_ERROR)
+        }
     }
 }
 

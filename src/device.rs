@@ -1,4 +1,4 @@
-use crate::host::Host;
+use crate::{host::Host, known};
 use serde_json::Value;
 use std::{collections::BTreeMap, fmt, thread};
 
@@ -20,6 +20,17 @@ pub enum Kind {
     Keyboard,
     Mouse,
     Trackpad,
+}
+
+impl Kind {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "keyboard" => Some(Self::Keyboard),
+            "mouse" => Some(Self::Mouse),
+            "trackpad" => Some(Self::Trackpad),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Kind {
@@ -54,7 +65,7 @@ pub struct Device {
 }
 
 impl Device {
-    fn new(address: String, name: String, kind: Kind) -> Self {
+    pub fn new(address: String, name: String, kind: Kind) -> Self {
         Self {
             address,
             name,
@@ -118,8 +129,15 @@ pub fn scan(hosts: &[Host]) -> Scan {
         }
     }
 
+    // A device no Mac reports any more is kept, with no links, so it can be rescued.
+    for remembered in known::load() {
+        devices
+            .entry(remembered.address.clone())
+            .or_insert(remembered);
+    }
     let mut devices: Vec<Device> = devices.into_values().collect();
     devices.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+    known::save(&devices);
     Scan { devices, reachable }
 }
 
