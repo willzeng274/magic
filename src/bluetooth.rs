@@ -1,4 +1,8 @@
-//! Moving a device: the Mac that holds it unpairs it, then the target Mac pairs it.
+//! Moving a device: the Mac that holds it unpairs it, then the target Mac pairs it at once
+//! and keeps trying until the device is really connected. If that fails it goes back.
+//!
+//! Pairing must not start before the release: while a Mac is calling a device its own
+//! outgoing SSH slows to a crawl, which delays the release past the pairing window.
 //!
 //! Every `blueutil` call goes over SSH, including calls to the local Mac. macOS aborts
 //! `blueutil` when a terminal app runs it, even with Bluetooth access granted, but allows
@@ -8,10 +12,11 @@ use crate::{
     device::{Device, Link},
     host::Host,
 };
-use std::{fmt, thread, time::Duration};
+use std::{fmt, time::Instant};
 
 const BLUEUTIL: &str = "/opt/homebrew/bin/blueutil";
-const PAIR_ATTEMPTS: u32 = 6;
+/// How long a Mac keeps trying to pair a device before giving up.
+const PAIR_SECONDS: u32 = 25;
 const SSH_FAILURES: &[&str] = &[
     "Permission denied",
     "Could not resolve",
@@ -90,37 +95,78 @@ pub fn move_device(hosts: &[Host], device: &Device, to: &str, log: impl Fn(&str)
     }
 
     let address = &device.address;
+    let origin = holders
+        .iter()
+        .copied()
+        .find(|host| device.links.get(&host.key) == Some(&Link::Connected));
+    if let Some(origin) = origin
+        && !is_connected(origin, address)
+    {
+        log(&format!(
+            "{name}: {} no longer has it connected. Nothing changed.",
+            origin.key
+        ));
+        return false;
+    }
+
+    let started = Instant::now();
     for host in &holders {
         log(&format!("{name}: releasing from {}", host.key));
         host.run_over_ssh(&format!("{BLUEUTIL} --unpair {address}"));
     }
-
-    // A released device needs a moment before it becomes discoverable again.
-    thread::sleep(Duration::from_secs(2));
     log(&format!("{name}: pairing on {to}"));
-    let connected = target
-        .run_over_ssh(&pair_script(address))
-        .text
-        .ends_with('1');
+    let connected = pair(target, address);
     if connected {
-        log(&format!("{name}: connected to {to}"));
-    } else {
         log(&format!(
-            "{name}: did not connect to {to}. Click or press a key on it and try again, \
-             or plug it into {to} with its cable."
+            "{name}: connected to {to} in {:.1}s",
+            started.elapsed().as_secs_f32()
         ));
+        return true;
     }
-    connected
+
+    // The target never got it, so try to put it back where it was.
+    if let Some(origin) = origin {
+        log(&format!(
+            "{name}: {to} could not get it, returning it to {}",
+            origin.key
+        ));
+        if pair(origin, address) {
+            log(&format!("{name}: back on {}", origin.key));
+            return false;
+        }
+    }
+    log(&format!(
+        "{name}: not connected to any Mac now. Plug it into {to} with its cable \
+         for a few seconds, or switch it off and on and try again."
+    ));
+    false
 }
 
-/// Shell script that pairs and connects a device, then prints 1 if it is connected.
+fn is_connected(host: &Host, address: &str) -> bool {
+    host.run_over_ssh(&format!("{BLUEUTIL} --is-connected {address}"))
+        .text
+        .ends_with('1')
+}
+
+/// Pairs and connects a device on one Mac. Returns whether it ended up connected.
+fn pair(host: &Host, address: &str) -> bool {
+    host.run_over_ssh(&pair_script(address)).text.ends_with('1')
+}
+
+/// Shell script that keeps pairing until the device is really connected, then prints 1.
+/// A pairing the device did not accept is removed before the next try.
 fn pair_script(address: &str) -> String {
+    // `blueutil --pair` can hang for minutes, so every call gets a time limit.
     format!(
-        "n=0; while [ $n -lt {PAIR_ATTEMPTS} ]; do \
-           {BLUEUTIL} --pair {address} >/dev/null 2>&1 && break; \
-           {BLUEUTIL} --inquiry 2 >/dev/null 2>&1; n=$((n+1)); \
-         done; \
-         {BLUEUTIL} --connect {address} >/dev/null 2>&1; sleep 1; \
-         {BLUEUTIL} --is-connected {address}"
+        "b() {{ perl -e 'alarm shift; exec @ARGV' \"$@\" >/dev/null 2>&1; }}; \
+         on() {{ [ \"$({BLUEUTIL} --is-connected {address} 2>/dev/null)\" = 1 ]; }}; \
+         end=$(( $(date +%s) + {PAIR_SECONDS} )); \
+         while [ $(date +%s) -lt $end ]; do \
+           on && echo 1 && exit 0; \
+           b 8 {BLUEUTIL} --pair {address}; \
+           b 6 {BLUEUTIL} --connect {address}; \
+           i=0; while [ $i -lt 4 ]; do on && echo 1 && exit 0; sleep 0.5; i=$((i+1)); done; \
+           b 4 {BLUEUTIL} --unpair {address}; \
+         done; echo 0"
     )
 }
