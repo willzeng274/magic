@@ -5,12 +5,12 @@ use std::{collections::BTreeMap, fmt, thread};
 const APPLE_VENDOR_ID: &str = "0x004C";
 const HID_MARKER: &str = "<<<HID>>>";
 
-/// Prints the Bluetooth device list as JSON, then the HID registry entries that say
-/// which devices are attached by cable.
+/// Prints the Bluetooth device list as JSON, then the HID registry entries, which say
+/// whether a device is attached by cable and what its battery level is.
 const SCAN_COMMAND: &str = concat!(
     "system_profiler SPBluetoothDataType -json; echo '<<<HID>>>'; ",
     "ioreg -r -c AppleDeviceManagementHIDEventService -l | ",
-    r#"grep -E '\+-o|"DeviceAddress"|"Product"|"Transport"'"#,
+    r#"grep -E '\+-o|"DeviceAddress"|"Product"|"Transport"|"BatteryPercent"'"#,
 );
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,7 +112,7 @@ pub fn scan(hosts: &[Host]) -> Scan {
         reachable.insert(host.clone(), report.is_some());
         if let Some(report) = report {
             read_bluetooth(&report, &host, &mut devices);
-            read_cabled(hid, &host, &mut devices);
+            read_hid(hid, &host, &mut devices);
         }
     }
 
@@ -152,8 +152,8 @@ fn read_bluetooth(report: &Value, host: &str, devices: &mut BTreeMap<String, Dev
 }
 
 /// Reads `ioreg` lines. Each registry entry starts with `+-o` and lists its
-/// address and product before its transport.
-fn read_cabled(hid: &str, host: &str, devices: &mut BTreeMap<String, Device>) {
+/// address and product before its transport and battery level.
+fn read_hid(hid: &str, host: &str, devices: &mut BTreeMap<String, Device>) {
     let mut address = String::new();
     let mut product = String::new();
     for line in hid.lines() {
@@ -172,6 +172,11 @@ fn read_cabled(hid: &str, host: &str, devices: &mut BTreeMap<String, Device>) {
                 Device::new(address.clone(), product.clone(), kind_from_name(&product))
             });
             device.links.insert(host.to_string(), Link::Usb);
+        } else if line.contains("\"BatteryPercent\"")
+            && let Some(device) = devices.get_mut(&address)
+        {
+            // The Bluetooth report leaves the level out for some devices; this one has it.
+            device.battery = Some(format!("{value}%"));
         }
     }
 }
