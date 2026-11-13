@@ -4,6 +4,8 @@ use std::{collections::BTreeMap, fmt, thread};
 
 const APPLE_VENDOR_ID: &str = "0x004C";
 const HID_MARKER: &str = "<<<HID>>>";
+const MOUSE_PRODUCT_IDS: &[&str] = &["0x030d", "0x0269", "0x0323"];
+const TRACKPAD_PRODUCT_IDS: &[&str] = &["0x030e", "0x0265", "0x0324"];
 
 /// Prints the Bluetooth device list as JSON, then the HID registry entries, which say
 /// whether a device is attached by cable and what its battery level is.
@@ -131,8 +133,7 @@ fn read_bluetooth(report: &Value, host: &str, devices: &mut BTreeMap<String, Dev
         let entries = controller[section].as_array().into_iter().flatten();
         for (name, info) in entries.filter_map(Value::as_object).flatten() {
             let field = |key: &str| info[key].as_str().unwrap_or_default();
-            let Some(kind) = magic_kind(name, field("device_minorType"), field("device_vendorID"))
-            else {
+            let Some(kind) = magic_kind(name, &field) else {
                 continue;
             };
             let address = field("device_address").to_uppercase();
@@ -182,19 +183,30 @@ fn read_hid(hid: &str, host: &str, devices: &mut BTreeMap<String, Device>) {
 }
 
 /// Returns the kind of device if it is an Apple or Magic keyboard, mouse or trackpad.
-fn magic_kind(name: &str, minor_type: &str, vendor_id: &str) -> Option<Kind> {
+fn magic_kind<'a>(name: &str, field: &impl Fn(&str) -> &'a str) -> Option<Kind> {
     let name = name.to_lowercase();
-    let minor_type = minor_type.to_lowercase();
+    let minor_type = field("device_minorType").to_lowercase();
+    let apple = field("device_vendorID").eq_ignore_ascii_case(APPLE_VENDOR_ID);
     let kind = if name.contains("trackpad") || minor_type.contains("trackpad") {
         Kind::Trackpad
     } else if minor_type.contains("keyboard") {
         Kind::Keyboard
     } else if minor_type.contains("mouse") {
         Kind::Mouse
+    } else if minor_type.is_empty() && apple && field("device_services").contains("HID") {
+        // A freshly paired device has no type yet, so go by its product ID and name.
+        let product = field("device_productID").to_lowercase();
+        if MOUSE_PRODUCT_IDS.contains(&product.as_str()) {
+            Kind::Mouse
+        } else if TRACKPAD_PRODUCT_IDS.contains(&product.as_str()) {
+            Kind::Trackpad
+        } else {
+            kind_from_name(&name)
+        }
     } else {
         return None;
     };
-    (vendor_id.eq_ignore_ascii_case(APPLE_VENDOR_ID) || name.contains("magic")).then_some(kind)
+    (apple || name.contains("magic")).then_some(kind)
 }
 
 fn kind_from_name(name: &str) -> Kind {
